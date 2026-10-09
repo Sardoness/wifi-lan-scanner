@@ -56,13 +56,14 @@ Esempi:
 ./wifi_check -o log.csv
 ```
 
+## Nozione
+
 Su macOS, dalla versione Sequoia in poi, il Terminale potrebbe dover
 chiedere l'accesso alla rete locale: Impostazioni di Sistema > Privacy
 e sicurezza > Rete locale.
 
 ## Note
 
-- Non serve `sudo`.
 - Un dispositivo con firewall rigido o in sospensione puo' non comparire
   nella scansione TCP; la tabella ARP aiuta a recuperarne alcuni.
 - iPhone e Android usano di default un indirizzo MAC privato/casuale per
@@ -70,6 +71,13 @@ e sicurezza > Rete locale.
   disattiva "Indirizzo privato" per la tua rete di casa nelle
   impostazioni Wi-Fi del telefono.
 - Usalo solo sulla tua rete o su reti per cui hai l'autorizzazione.
+
+
+## Rappresentazione schematica del sistema "scanner"
+
+
+<img width="5760" height="3240" alt="flusso_operativo_trasparente_5760x3240" src="https://github.com/user-attachments/assets/99dc3f03-24a1-4dfa-bcd0-e08a86af0d1e" />
+
 
 ## Licenza
 
