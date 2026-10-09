@@ -73,4 +73,7 @@ e sicurezza > Rete locale.
 
 ## Licenza
 
-MIT, vedi [LICENSE](LICENSE).
+© 2026 Sardoness. Tutti i diritti riservati — vedi [LICENSE](LICENSE).
+
+Il codice è pubblicato per scopo dimostrativo e di portfolio. Per usarlo,
+modificarlo o redistribuirlo, chiedi prima il permesso all'autore.
