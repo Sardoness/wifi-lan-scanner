@@ -109,7 +109,7 @@ static int is_private_mac(const char *mac) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Elenco dei dispositivi noti                                         */
+/* Elenco dei dispositivi noti/presenti nell'abitazione                                         */
 /* ------------------------------------------------------------------ */
 
 static void load_known_devices(void) {
