@@ -1,7 +1,9 @@
 /*
  * wifi_check.c
  *
- * Semplice monitor per la propria rete locale (LAN/Wi-Fi), per macOS e Linux.
+ * Monitor per la propria rete locale (LAN/Wi-Fi), per macOS e Linux, con
+ * dashboard web opzionale che mostra i risultati in tempo reale nel browser.
+ *
  * Individua i dispositivi connessi tramite scansione TCP e tabella ARP,
  * li confronta con un elenco di dispositivi noti, e puo' ripetere la
  * scansione nel tempo per segnalare quando un dispositivo entra o esce.
@@ -13,7 +15,7 @@
  * Compilazione: cc -O2 -Wall -Wextra -o wifi_check wifi_check.c
  * Aiuto:        ./wifi_check -h
  *
- * Licenza: MIT (vedi file LICENSE del repository)
+ * Licenza: vedi file LICENSE del repository (tutti i diritti riservati).
  */
 #define _DEFAULT_SOURCE
 #include <arpa/inet.h>
@@ -36,6 +38,7 @@
 
 #define MAX_PORTS 16
 #define MAX_KNOWN 256
+#define JSON_BUF_SIZE (192 * 1024)
 
 typedef struct {
     int alive;
@@ -59,6 +62,8 @@ static int g_watch_seconds = 0;
 static int g_learn = 0;
 static const char *g_known_file = NULL;
 static const char *g_csv_file = NULL;
+static int g_web_port = 0;
+static int g_web_all_if = 0;
 
 /* ---------------- stato ---------------- */
 static Host g_hosts[256];
@@ -66,6 +71,8 @@ static Host g_prev_hosts[256];
 static KnownDevice g_known[MAX_KNOWN];
 static int g_nknown = 0;
 static volatile sig_atomic_t g_stop = 0;
+static char g_json_buf[JSON_BUF_SIZE] = "{\"hosts\":[]}";
+static int g_listen_fd = -1;
 
 static void handle_sigint(int signum) {
     (void)signum;
@@ -302,8 +309,9 @@ static void resolve_hostname(uint32_t ip_val, char *out, size_t size) {
         out[0] = '\0';
 }
 
-static void print_ssid(const char *ifname) {
-    char cmd[128], line[256];
+static void get_ssid(const char *ifname, char *out, size_t size) {
+    char cmd[128], line[192];
+    out[0] = '\0';
 #ifdef __APPLE__
     snprintf(cmd, sizeof cmd, "networksetup -getairportnetwork %s 2>/dev/null", ifname);
 #else
@@ -316,9 +324,9 @@ static void print_ssid(const char *ifname) {
         line[strcspn(line, "\n")] = '\0';
 #ifdef __APPLE__
         char *marker = strstr(line, "Current Wi-Fi Network: ");
-        if (marker) printf("Rete Wi-Fi (SSID): %s\n", marker + strlen("Current Wi-Fi Network: "));
+        if (marker) snprintf(out, size, "%s", marker + strlen("Current Wi-Fi Network: "));
 #else
-        if (line[0]) printf("Rete Wi-Fi (SSID): %s\n", line);
+        snprintf(out, size, "%s", line);
 #endif
     }
     pclose(pipe);
@@ -342,7 +350,7 @@ static void run_full_scan(uint32_t subnet_base, int own_host) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Output                                                              */
+/* Output testuale                                                     */
 /* ------------------------------------------------------------------ */
 
 static void ip_at(uint32_t subnet_base, int h, char *out) {
@@ -460,6 +468,230 @@ static void append_csv_row(uint32_t subnet_base, int own_host) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Dashboard web                                                       */
+/* ------------------------------------------------------------------ */
+
+static void json_escape(const char *in, char *out, size_t outsz) {
+    size_t o = 0;
+    for (; *in && o + 2 < outsz; in++) {
+        unsigned char c = (unsigned char)*in;
+        if (c == '"' || c == '\\') {
+            if (o + 2 >= outsz) break;
+            out[o++] = '\\';
+            out[o++] = (char)c;
+        } else if (c >= 0x20) {
+            out[o++] = (char)c;
+        }
+    }
+    out[o] = '\0';
+}
+
+/* Ricostruisce lo snapshot JSON letto dalla dashboard (endpoint /api/scan). */
+static void build_json_snapshot(uint32_t subnet_base, int own_host, const char *ifname,
+                                 const char *ip_str, const char *ssid, int round) {
+    char *p = g_json_buf;
+    char *end = g_json_buf + JSON_BUF_SIZE;
+    char esc[256], timestamp[32];
+    int unknown_count = 0, first = 1, n;
+
+    format_time(timestamp, sizeof timestamp, "%Y-%m-%d %H:%M:%S");
+    json_escape(ssid, esc, sizeof esc);
+
+    n = snprintf(p, (size_t)(end - p),
+                 "{\"interface\":\"%s\",\"ip\":\"%s\",\"subnet\":\"%u.%u.%u.0/24\","
+                 "\"ssid\":\"%s\",\"timestamp\":\"%s\",\"round\":%d,\"hosts\":[",
+                 ifname, ip_str, (subnet_base >> 24) & 255, (subnet_base >> 16) & 255,
+                 (subnet_base >> 8) & 255, esc, timestamp, round);
+    if (n < 0 || p + n >= end) return;
+    p += n;
+
+    for (int h = 1; h <= 254; h++) {
+        Host *host = &g_hosts[h];
+        if (!host->alive || h == own_host) continue;
+        char ip[INET_ADDRSTRLEN], ports[96], note[300], esc_host[256], esc_note[300];
+        ip_at(subnet_base, h, ip);
+        format_open_ports(host->open_mask, ports, sizeof ports);
+        format_note(host, note, sizeof note);
+        json_escape(host->hostname, esc_host, sizeof esc_host);
+        json_escape(note, esc_note, sizeof esc_note);
+
+        n = snprintf(p, (size_t)(end - p),
+                     "%s{\"ip\":\"%s\",\"mac\":\"%s\",\"hostname\":\"%s\",\"ports\":\"%s\","
+                     "\"note\":\"%s\",\"known\":%s,\"private_mac\":%s}",
+                     first ? "" : ",", ip, host->mac[0] ? host->mac : "", esc_host, ports,
+                     esc_note, host->known_name ? "true" : "false",
+                     (host->mac[0] && is_private_mac(host->mac)) ? "true" : "false");
+        if (n < 0 || p + n >= end) break;
+        p += n;
+        first = 0;
+        if (!host->known_name) unknown_count++;
+    }
+    n = snprintf(p, (size_t)(end - p), "],\"unknown_count\":%d}", unknown_count);
+    if (n > 0 && p + n < end) p += n;
+}
+
+static const char DASHBOARD_HTML[] =
+"<!DOCTYPE html>\n"
+"<html lang='it'>\n"
+"<head>\n"
+"<meta charset='utf-8'>\n"
+"<meta name='viewport' content='width=device-width, initial-scale=1'>\n"
+"<title>wifi-lan-scanner</title>\n"
+"<style>\n"
+"  :root { color-scheme: dark; }\n"
+"  * { box-sizing: border-box; }\n"
+"  body { margin: 0; padding: 24px; background: #11151c; color: #e6e9ef;\n"
+"         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }\n"
+"  h1 { font-size: 20px; margin: 0 0 4px; }\n"
+"  .meta { color: #8b93a3; font-size: 13px; margin-bottom: 18px; line-height: 1.6; }\n"
+"  .meta b { color: #d7dbe3; }\n"
+"  .stats { display: flex; gap: 12px; margin-bottom: 18px; flex-wrap: wrap; }\n"
+"  .stat { background: #1a2030; border-radius: 10px; padding: 10px 16px; min-width: 110px; }\n"
+"  .stat .n { font-size: 22px; font-weight: 600; }\n"
+"  .stat .l { font-size: 12px; color: #8b93a3; }\n"
+"  table { width: 100%; border-collapse: collapse; font-size: 13px; }\n"
+"  th { text-align: left; color: #8b93a3; font-weight: 500; padding: 8px 10px;\n"
+"       border-bottom: 1px solid #262c3a; }\n"
+"  td { padding: 9px 10px; border-bottom: 1px solid #1d2230; vertical-align: top; }\n"
+"  tr.unknown { background: rgba(224, 90, 90, 0.08); }\n"
+"  .badge { display: inline-block; font-size: 11px; padding: 2px 7px; border-radius: 999px;\n"
+"           margin-left: 6px; }\n"
+"  .badge.unknown { background: #4a2228; color: #ff9b9b; }\n"
+"  .badge.private { background: #2a3550; color: #9ec2ff; }\n"
+"  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }\n"
+"  .empty { color: #8b93a3; padding: 30px 0; text-align: center; }\n"
+"  footer { margin-top: 18px; color: #5d6577; font-size: 12px; }\n"
+"</style>\n"
+"</head>\n"
+"<body>\n"
+"<h1>wifi-lan-scanner</h1>\n"
+"<div class='meta' id='meta'>Caricamento in corso...</div>\n"
+"<div class='stats' id='stats'></div>\n"
+"<table>\n"
+"  <thead><tr><th>IP</th><th>MAC</th><th>Nome host</th><th>Porte</th><th>Note</th></tr></thead>\n"
+"  <tbody id='rows'><tr><td colspan='5' class='empty'>In attesa della prima scansione...</td></tr></tbody>\n"
+"</table>\n"
+"<footer>Aggiornamento automatico ogni 3 secondi. Pagina locale, non esposta su internet.</footer>\n"
+"<script>\n"
+"function esc(s) {\n"
+"  var d = document.createElement('div');\n"
+"  d.textContent = s || '';\n"
+"  return d.innerHTML;\n"
+"}\n"
+"function refresh() {\n"
+"  fetch('/api/scan', { cache: 'no-store' }).then(function(r) { return r.json(); })\n"
+"  .then(function(data) {\n"
+"    var hosts = data.hosts || [];\n"
+"    document.getElementById('meta').innerHTML =\n"
+"      '<b>' + esc(data.interface || '-') + '</b> &middot; ' + esc(data.ip || '-') +\n"
+"      ' &middot; rete ' + esc(data.ssid || '-') + ' (' + esc(data.subnet || '-') + ')' +\n"
+"      '<br>Ultimo aggiornamento: ' + esc(data.timestamp || '-') +\n"
+"      ' &middot; scansione n.' + (data.round || 0);\n"
+"    document.getElementById('stats').innerHTML =\n"
+"      '<div class=\"stat\"><div class=\"n\">' + hosts.length + '</div><div class=\"l\">dispositivi</div></div>' +\n"
+"      '<div class=\"stat\"><div class=\"n\">' + (data.unknown_count || 0) + '</div><div class=\"l\">sconosciuti</div></div>';\n"
+"    var rows = document.getElementById('rows');\n"
+"    if (!hosts.length) {\n"
+"      rows.innerHTML = '<tr><td colspan=\"5\" class=\"empty\">Nessun dispositivo rilevato</td></tr>';\n"
+"      return;\n"
+"    }\n"
+"    var html = '';\n"
+"    for (var i = 0; i < hosts.length; i++) {\n"
+"      var h = hosts[i];\n"
+"      var cls = (!h.known && h.note) ? 'unknown' : '';\n"
+"      var badges = '';\n"
+"      if (!h.known) badges += '<span class=\"badge unknown\">sconosciuto</span>';\n"
+"      if (h.private_mac) badges += '<span class=\"badge private\">MAC privato</span>';\n"
+"      html += '<tr class=\"' + cls + '\">' +\n"
+"        '<td class=\"mono\">' + esc(h.ip) + '</td>' +\n"
+"        '<td class=\"mono\">' + esc(h.mac || '?') + '</td>' +\n"
+"        '<td>' + esc(h.hostname || '-') + '</td>' +\n"
+"        '<td class=\"mono\">' + esc(h.ports || '-') + '</td>' +\n"
+"        '<td>' + badges + '</td></tr>';\n"
+"    }\n"
+"    rows.innerHTML = html;\n"
+"  })\n"
+"  .catch(function() {\n"
+"    document.getElementById('meta').textContent = 'Connessione al programma persa.';\n"
+"  });\n"
+"}\n"
+"refresh();\n"
+"setInterval(refresh, 3000);\n"
+"</script>\n"
+"</body>\n"
+"</html>\n";
+
+static int start_http_server(int port, int all_interfaces) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    addr.sin_addr.s_addr = all_interfaces ? htonl(INADDR_ANY) : htonl(INADDR_LOOPBACK);
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) { close(fd); return -1; }
+    if (listen(fd, 16) < 0) { close(fd); return -1; }
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+    return fd;
+}
+
+static void handle_http_client(int cfd) {
+    char req[2048];
+    struct timeval rcvto = {2, 0};
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &rcvto, sizeof rcvto);
+
+    ssize_t n = recv(cfd, req, sizeof req - 1, 0);
+    if (n <= 0) { close(cfd); return; }
+    req[n] = '\0';
+
+    char method[8] = "", path[256] = "";
+    sscanf(req, "%7s %255s", method, path);
+
+    const char *body; size_t body_len; const char *content_type;
+    if (strcmp(path, "/api/scan") == 0) {
+        body = g_json_buf;
+        body_len = strlen(g_json_buf);
+        content_type = "application/json";
+    } else {
+        body = DASHBOARD_HTML;
+        body_len = sizeof DASHBOARD_HTML - 1;
+        content_type = "text/html; charset=utf-8";
+    }
+
+    char header[256];
+    int hlen = snprintf(header, sizeof header,
+                         "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+                         "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+                         content_type, body_len);
+    if (hlen > 0) send(cfd, header, (size_t)hlen, 0);
+    send(cfd, body, body_len, 0);
+    close(cfd);
+}
+
+/* Accetta e gestisce le richieste in arrivo per fino a total_ms millisecondi. */
+static void serve_http_for(int listen_fd, int total_ms) {
+    long deadline = now_ms() + total_ms;
+    while (!g_stop) {
+        long remaining = deadline - now_ms();
+        if (remaining <= 0) break;
+        struct timeval tv = {remaining / 1000, (remaining % 1000) * 1000};
+        fd_set rs;
+        FD_ZERO(&rs);
+        FD_SET(listen_fd, &rs);
+        int r = select(listen_fd + 1, &rs, NULL, NULL, &tv);
+        if (r <= 0) continue;
+        if (FD_ISSET(listen_fd, &rs)) {
+            int cfd = accept(listen_fd, NULL, NULL);
+            if (cfd >= 0) handle_http_client(cfd);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Riga di comando                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -476,14 +708,17 @@ static void print_usage(const char *prog) {
         "  -a        aggiunge i dispositivi attualmente connessi al file indicato con -k\n"
         "  -o FILE   aggiunge ogni scansione a un file CSV\n"
         "  -w SEC    modalita' monitor: ripete la scansione ogni SEC secondi (Ctrl+C per fermare)\n"
+        "  -H PORTA  avvia una dashboard web su http://127.0.0.1:PORTA (implica -w se assente)\n"
+        "  -A        con -H, apri la dashboard anche al resto della rete (nessuna password!)\n"
         "  -n        non risolvere i nomi host (scansione piu' veloce)\n"
         "  -h        mostra questo aiuto\n"
         "\n"
         "Esempi:\n"
         "  %s                          scansione singola della rete corrente\n"
         "  %s -k noti.txt -a           registra i dispositivi attuali come \"noti\"\n"
-        "  %s -k noti.txt -w 30        monitor continuo, segnala gli sconosciuti\n",
-        prog, prog, prog, prog);
+        "  %s -k noti.txt -w 30        monitor continuo, segnala gli sconosciuti\n"
+        "  %s -k noti.txt -H 8787      dashboard web su http://127.0.0.1:8787\n",
+        prog, prog, prog, prog, prog);
 }
 
 static int parse_port_list(char *list) {
@@ -500,7 +735,7 @@ int main(int argc, char **argv) {
     const char *wanted_if = NULL;
     int opt;
 
-    while ((opt = getopt(argc, argv, "i:p:t:k:ao:w:nh")) != -1) {
+    while ((opt = getopt(argc, argv, "i:p:t:k:ao:w:H:Anh")) != -1) {
         switch (opt) {
         case 'i': wanted_if = optarg; break;
         case 'p':
@@ -514,6 +749,14 @@ int main(int argc, char **argv) {
         case 'a': g_learn = 1; break;
         case 'o': g_csv_file = optarg; break;
         case 'w': g_watch_seconds = atoi(optarg); if (g_watch_seconds < 1) g_watch_seconds = 1; break;
+        case 'H':
+            g_web_port = atoi(optarg);
+            if (g_web_port < 1 || g_web_port > 65535) {
+                fprintf(stderr, "Porta non valida per -H.\n");
+                return 1;
+            }
+            break;
+        case 'A': g_web_all_if = 1; break;
         case 'n': g_resolve_dns = 0; break;
         case 'h': print_usage(argv[0]); return 0;
         default: print_usage(argv[0]); return 1;
@@ -523,6 +766,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "L'opzione -a richiede anche -k FILE.\n");
         return 1;
     }
+    if (g_web_all_if && !g_web_port) {
+        fprintf(stderr, "L'opzione -A richiede anche -H PORTA.\n");
+        return 1;
+    }
+    if (g_web_port && !g_watch_seconds) g_watch_seconds = 20; /* mantiene viva la dashboard */
 
     char ifname[IF_NAMESIZE] = "";
     struct in_addr local_ip;
@@ -550,10 +798,26 @@ int main(int argc, char **argv) {
 
     char ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &local_ip, ip_str, sizeof ip_str);
+    char ssid_buf[192] = "";
+    get_ssid(ifname, ssid_buf, sizeof ssid_buf);
+
     printf("Interfaccia: %s | IP: %s | Scansione: %u.%u.%u.0/24\n", ifname, ip_str,
            (subnet_base >> 24) & 255, (subnet_base >> 16) & 255, (subnet_base >> 8) & 255);
-    print_ssid(ifname);
+    if (ssid_buf[0]) printf("Rete Wi-Fi (SSID): %s\n", ssid_buf);
     if (g_known_file) printf("Dispositivi noti caricati: %d\n", g_nknown);
+
+    if (g_web_port) {
+        g_listen_fd = start_http_server(g_web_port, g_web_all_if);
+        if (g_listen_fd < 0) {
+            fprintf(stderr, "Impossibile avviare la dashboard sulla porta %d (gia' in uso?).\n",
+                    g_web_port);
+            return 1;
+        }
+        printf("Dashboard web: http://127.0.0.1:%d\n", g_web_port);
+        if (g_web_all_if)
+            printf("  (visibile anche da altri dispositivi come http://%s:%d -- senza password!)\n",
+                   ip_str, g_web_port);
+    }
     if (g_watch_seconds) printf("Modalita' monitor ogni %d s. Premi Ctrl+C per uscire.\n", g_watch_seconds);
     printf("Scansione in corso...\n\n");
 
@@ -561,6 +825,8 @@ int main(int argc, char **argv) {
     do {
         run_full_scan(subnet_base, own_host);
         if (g_stop) break;
+
+        if (g_web_port) build_json_snapshot(subnet_base, own_host, ifname, ip_str, ssid_buf, round);
 
         if (round == 0 || !g_watch_seconds)
             print_table(subnet_base, own_host);
@@ -572,9 +838,16 @@ int main(int argc, char **argv) {
 
         memcpy(g_prev_hosts, g_hosts, sizeof g_hosts);
         round++;
-        for (int s = 0; g_watch_seconds && s < g_watch_seconds && !g_stop; s++) sleep(1);
+
+        if (g_watch_seconds && !g_stop) {
+            if (g_listen_fd >= 0)
+                serve_http_for(g_listen_fd, g_watch_seconds * 1000);
+            else
+                for (int s = 0; s < g_watch_seconds && !g_stop; s++) sleep(1);
+        }
     } while (g_watch_seconds && !g_stop);
 
+    if (g_listen_fd >= 0) close(g_listen_fd);
     if (g_watch_seconds) printf("\nMonitor terminato.\n");
     return 0;
 }
