@@ -1,0 +1,5 @@
+wifi_check
+*.o
+*.csv
+noti.txt
+.DS_Store
